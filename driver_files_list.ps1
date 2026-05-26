@@ -27,20 +27,32 @@ $Content = Get-Content $InfPath
 $InstallSectionLine = $Content | Select-String -Pattern $HwId | Select-Object -First 1
 $InstallSection = ($InstallSectionLine -split "=")[1].Split(",")[0].Trim()
 
-Write-Host "Searching INF for Install Section: [$InstallSection]" -ForegroundColor Cyan
+# 5. OPTIMIZED: Isolate [DestinationDirs] section and extract non-DriverStore sections
+$StartIndex = [array]::FindIndex($Content, [Predicate[string]]{ $args[0] -match "^\[DestinationDirs\]" }) #Since we now get the Lines with the Files, Maybe is more pratical to reconstruct from it and not by search
 
-# 5. Find the 'CopyFiles' lists within that section
-$CopyFileSections = @()
-$InTargetSection = $false
-
-foreach ($line in $Content) {
-    if ($line -match "\[$InstallSection(\.ntamd64)?\]") { $InTargetSection = $true; continue }
-    if ($InTargetSection -and $line -match "^\[") { $InTargetSection = $false }
-    
-    if ($InTargetSection -and $line -match "CopyFiles\s*=\s*(.*)") {
-        $CopyFileSections += $matches[1].Split(",").Trim()
+if ($StartIndex -ne -1) {
+    # Get all lines following [DestinationDirs] until the next section header '['
+    $DestinationDirsLines = @()
+    for ($i = $StartIndex + 1; $i -lt $Content.Count; $i++) {
+        if ($Content[$i] -match "^\[") { break } # Stop when the next section begins
+        if ($Content[$i].Trim()) { $DestinationDirsLines += $Content[$i] } # Keep non-empty lines
     }
+
+    # 5b. Filter out the lines assigned to 13, and extract the section/key names
+    $CopyFileSections = foreach ($Line in $DestinationDirsLines) {
+        # Check if the line has a valid key assignment, but skip if it assigns to 13
+        if ($Line -match "^\s*([^\s=]+)\s*=" -and $Line -notmatch "=\s*13\b") {
+            $Matches[1].Trim() # Captures the section name (e.g., DS.System32, R300.AMDKMPFD)
+        }
+    }
+} else {
+    Write-Host "[DestinationDirs] section not found in the INF file!" -ForegroundColor Red
+    $CopyFileSections = @()
 }
+
+Write-Host "Found sections to parse (excluding ID 13): $($CopyFileSections -join ', ')" -ForegroundColor Gray
+
+Write-Host "Searching INF for Install Section: [$InstallSection]" -ForegroundColor Cyan
 
 # 6. Extract filenames from each identified CopyFiles section
 $DriverFiles = New-Object System.Collections.Generic.HashSet[string]
@@ -57,7 +69,7 @@ foreach ($Sect in $CopyFileSections) {
     foreach ($line in $Content) {
         if ($line -match "^\[$([regex]::Escape($Sect))\]") { $InCopySection = $true; continue }
         if ($InCopySection -and $line -match "^\[") { $InCopySection = $false }
-        
+
         if ($InCopySection -and $line.Trim() -and $line -notmatch "^;") {
             # Filenames are the first part of the comma-separated line
             $FileName = $line.Split(",")[0].Trim()
@@ -69,11 +81,10 @@ foreach ($Sect in $CopyFileSections) {
 # 7. Build a lookup table (Hashtable) of all files in those directories
 $DriverStoreLocation = Get-WindowsDriver -Online | Where-Object { $_.Driver -eq "$DriverName" } | Select-Object -ExpandProperty OriginalFileName
 $DriverStoreLocation = Split-Path -Path $DriverStoreLocation -Parent
-$searchPaths = @("C:\Windows\System32", "C:\Windows\SysWOW64", "$DriverStoreLocation") #falta colocar a pasta da driverstore
+$searchPaths = @("C:\Windows\System32", "C:\Windows\SysWOW64")
 
 $fileLookup = @{}
-
-Get-ChildItem -Path $searchPaths -Recurse -Depth 2 -File -ErrorAction SilentlyContinue | ForEach-Object {
+Get-ChildItem -Path $searchPaths -Recurse -Depth 2 -File -ErrorAction SilentlyContinue | Where-Object { $_.DirectoryName -notmatch [regex]::Escape("C:\Windows\System32\DriverStore*") } | ForEach-Object {
     if (-not $fileLookup.ContainsKey($_.Name)) {
         $fileLookup[$_.Name] = New-Object System.Collections.Generic.List[string]
     }
@@ -109,7 +120,7 @@ foreach ($item in $results){
             if (($splited[4] -ne "FileRepository")){
                $dest = $OUTPUTPATH + "\" + $splited[2]
                 $i = 3;
-                while (($dest -split "\\")[-1] -ne $splited[-2]){ 
+                while (($dest -split "\\")[-1] -ne $splited[-2]){
                     $dest = $dest + "\" + $splited[$i]
                     $i = $i + 1
                     $null = New-Item -Path $dest -ItemType Directory -Force
